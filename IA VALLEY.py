@@ -239,6 +239,7 @@ class FinancialAnalyzerWithFinMA:
 {context_text}
 
 Forneça uma análise objetiva focada em:
+#
 1. Principais riscos identificados
 2. Oportunidades de melhoria
 3. Recomendações prioritárias
@@ -430,3 +431,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
