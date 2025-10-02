@@ -1,12 +1,9 @@
 import pyodbc
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
-from scipy import stats
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 try:
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -16,432 +13,409 @@ except ImportError:
     FINMA_AVAILABLE = False
     print("⚠️ Bibliotecas do FinMA-7B não encontradas. Usando análise estatística padrão.")
 
-class EnhancedFinancialAnalyzer:
+class FinancialAnalyzerWithFinMA:
     def __init__(self, connection_string):
-        """
-        Inicializa o analisador financeiro aprimorado
-        """
         self.connection_string = connection_string
         self.conn = None
         self.finma_model = None
         self.finma_tokenizer = None
         
-        # Mapeamento para classificação de contas
-        self.conta_mapping = {
-            'ativo_circulante': ['111'],
-            'ativo_nao_circulante': ['112'],
-            'passivo_circulante': ['211'],
-            'passivo_nao_circulante': ['221'],
-            'patrimonio_liquido': ['231'],
-            'receita_bruta': ['311', '312', '313', '315'],
-            'custos_vendas': ['411', '412', '413', '415'],
-            'despesas_operacionais': ['511', '512'],
-        }
+        # Tabelas de referência
+        self.dfc_mapping = self._create_dfc_mapping()
+        self.indicators_mapping = self._create_indicators_mapping()
         
-        # Configuração do FinMA-7B
         if FINMA_AVAILABLE:
-            try:
-                print("🔄 Carregando modelo FinMA-7B...")
-                self.finma_tokenizer = AutoTokenizer.from_pretrained("ChanceFocus/finma-7b-nlp")
-                self.finma_model = AutoModelForCausalLM.from_pretrained(
-                    "ChanceFocus/finma-7b-nlp", 
-                    torch_dtype=torch.float16,
-                    device_map="auto"
-                )
-                print("✅ FinMA-7B carregado com sucesso!")
-            except Exception as e:
-                print(f"⚠️ Erro ao carregar FinMA-7B: {e}")
-                self.finma_model = None
+            self._load_finma_model()
+    
+    def _create_dfc_mapping(self):
+        """Cria mapeamento de DFC"""
+        return {
+            'D.1': {'linha': '(+) Resultado do Exercício', 'agrupador': 'Resultado Líquido Ajustado', 'ordem': 1},
+            'D.2': {'linha': '(-) Depreciação', 'agrupador': 'Resultado Líquido Ajustado', 'ordem': 1},
+            'D.3': {'linha': '(=) Geração Bruta de Caixa', 'agrupador': 'Resultado Líquido Ajustado', 'ordem': 1},
+            'D.4': {'linha': 'Variação de NCG', 'agrupador': 'Variação da NCG', 'ordem': 2},
+            'D.5': {'linha': '(+/-) Var Fornecedores', 'agrupador': 'Variação da NCG', 'ordem': 2},
+            'D.6': {'linha': '(+/-) Var Outros Passivos Operacionais', 'agrupador': 'Variação da NCG', 'ordem': 2},
+            'D.7': {'linha': '(+/-) Var Contas a Receber', 'agrupador': 'Variação da NCG', 'ordem': 2},
+            'D.8': {'linha': '(+/-) Var Estoques', 'agrupador': 'Variação da NCG', 'ordem': 2},
+            'D.9': {'linha': '(+/-) Var Outros Ativos Operacionais', 'agrupador': 'Variação da NCG', 'ordem': 2},
+            'D.10': {'linha': '(=) Fluxo de Caixa da Operação', 'agrupador': '(=) Fluxo de Caixa da Operação', 'ordem': 3},
+            'D.11': {'linha': '(+/-) CAPEX', 'agrupador': '( +/- ) Atividades de Investimento', 'ordem': 4},
+            'D.12': {'linha': '(+/-) Intangível', 'agrupador': '( +/- ) Atividades de Investimento', 'ordem': 4},
+            'D.13': {'linha': '(+/-) Outros Ativos/Passivos Não Circulantes', 'agrupador': '( +/- ) Atividades de Investimento', 'ordem': 4},
+            'D.14': {'linha': '(=) Fluxo de Caixa Pós-Investimentos', 'agrupador': '(=) Fluxo de Caixa Pós-Investimentos', 'ordem': 5},
+            'D.15': {'linha': '(+/-) Empréstimos e Financiamento CP', 'agrupador': '( +/- ) Atividades de Financiamento', 'ordem': 6},
+            'D.16': {'linha': '(+/-) Empréstimos e Financiamento LP', 'agrupador': '( +/- ) Atividades de Financiamento', 'ordem': 6},
+            'D.17': {'linha': '(+/-) Recebíveis e Investimentos LP', 'agrupador': '( +/- ) Atividades de Financiamento', 'ordem': 6},
+            'D.18': {'linha': '(+/-)  Patrimonial, Ingralização e Distr Capital', 'agrupador': '( +/- ) Atividades de Financiamento', 'ordem': 6},
+            'D.19': {'linha': '(=) Fluxo de Caixa', 'agrupador': '(=) Fluxo de Caixa', 'ordem': 7},
+            'D.20': {'linha': 'Saldo Inicial de Caixa', 'agrupador': 'Saldo Inicial de Caixa', 'ordem': 8},
+            'D.21': {'linha': 'Saldo Final de Caixa', 'agrupador': 'Saldo Final de Caixa', 'ordem': 9}
+        }
+    
+    def _create_indicators_mapping(self):
+        """Cria mapeamento completo de indicadores"""
+        return {
+            1: {'nome': '% Despesas fixas / ROL', 'tipo': '% ROL', 'melhor': 'Menor', 'unidade': '%'},
+            2: {'nome': 'Margem de Contribuição', 'tipo': 'Rentabilidade', 'melhor': 'Maior', 'unidade': '%'},
+            3: {'nome': 'Liquidez Corrente', 'tipo': 'Liquidez', 'melhor': 'Maior', 'unidade': '#'},
+            4: {'nome': 'Liquidez Seca', 'tipo': 'Liquidez', 'melhor': 'Maior', 'unidade': '#'},
+            5: {'nome': 'Liquidez Geral', 'tipo': 'Liquidez', 'melhor': 'Maior', 'unidade': '#'},
+            6: {'nome': 'Grau de Imobilização s/ Ativo', 'tipo': 'Estrutura', 'melhor': 'Menor', 'unidade': '%'},
+            7: {'nome': 'Participação Capital Terceiros (PCT)', 'tipo': 'Estrutura', 'melhor': 'Menor', 'unidade': '%'},
+            8: {'nome': 'Participação Capital Próprio (Equity)', 'tipo': 'Estrutura', 'melhor': 'Maior', 'unidade': '%'},
+            9: {'nome': 'Imobilização Patrimônio Líquido (IPL)', 'tipo': 'Estrutura', 'melhor': 'Menor', 'unidade': '%'},
+            10: {'nome': 'Retorno Sobre Ativos (ROA)', 'tipo': 'Rentabilidade', 'melhor': 'Maior', 'unidade': '%'},
+            11: {'nome': 'Retorno Sobre PL (ROE)', 'tipo': 'Rentabilidade', 'melhor': 'Maior', 'unidade': '%'},
+            12: {'nome': 'Margem Líquida', 'tipo': 'Rentabilidade', 'melhor': 'Maior', 'unidade': '%'},
+            13: {'nome': 'Giro de Ativos', 'tipo': 'Estrutura', 'melhor': 'Maior', 'unidade': '#'},
+            14: {'nome': '% Despesas sobre Vendas (c/Desp Fin.)', 'tipo': '% ROL', 'melhor': 'Menor', 'unidade': '%'},
+            28: {'nome': 'Giro de Estoque de Peças', 'tipo': 'Peças', 'melhor': 'Maior', 'unidade': '#'},
+            29: {'nome': 'EBITDA', 'tipo': 'Rentabilidade', 'melhor': 'Maior', 'unidade': '%'},
+            30: {'nome': 'Margem Bruta', 'tipo': 'Rentabilidade', 'melhor': 'Maior', 'unidade': '%'},
+            31: {'nome': '% Despesas sobre Vendas (s/Desp Fin.)', 'tipo': '% ROL', 'melhor': 'Menor', 'unidade': '%'}
+        }
+    
+    def _load_finma_model(self):
+        """Carrega modelo FinMA-7B"""
+        try:
+            print("🔄 Carregando modelo FinMA-7B...")
+            self.finma_tokenizer = AutoTokenizer.from_pretrained("ChanceFocus/finma-7b-nlp")
+            self.finma_model = AutoModelForCausalLM.from_pretrained(
+                "ChanceFocus/finma-7b-nlp",
+                torch_dtype=torch.float16,
+                device_map="auto",
+                low_cpu_mem_usage=True
+            )
+            print("✅ FinMA-7B carregado com sucesso!")
+        except Exception as e:
+            print(f"⚠️ Erro ao carregar FinMA-7B: {e}")
+            self.finma_model = None
     
     def connect_database(self):
-        """Conecta ao banco de dados SQL Server"""
+        """Conecta ao banco de dados"""
         try:
             self.conn = pyodbc.connect(self.connection_string)
-            print("✅ Conexão com banco de dados estabelecida!")
+            print("✅ Conexão estabelecida!")
             return True
         except Exception as e:
             print(f"❌ Erro na conexão: {e}")
             return False
     
     def get_company_data(self, cod_empresa):
-        """
-        Extrai dados financeiros da empresa específica utilizando os valores já calculados
-        """
+        """Extrai dados da empresa"""
         query = """
         SELECT 
-            b.[Mês],
-            b.Ano,
-            b.[Cod Grupo Empresa],
-            b.[Cod Empresa],
-            b.[Cod Filial],
-            b.[Cod Centro Custo],
-            b.[Cod Conta Contabil PN],
-            p.[DESCRIÇÃO CONTA],
-            p.DescN0,
-            p.DescN1,
-            p.DescN2,
-            p.DescN3,
-            b.[Conta Cliente],
-            b.[Dsc Conta Cliente],
-            b.Saldo,
-            b.R12,
-            b.R1,
-            b.KeyEmpresa,
-            b.dIndicador,
-            i.Indicador as DescIndicador,
-            b.R1Indicador,
-            b.R12Indicador,
-            b.dContaDFC,
-            dfc.LinhaDFC,
-            dfc.Agrupador,
-            dfc.OrdemAgrupador,
-            -- Campos para classificação
-            CASE 
-                WHEN p.DescN0 = 'ATIVO' AND p.DescN1 LIKE '%Circulante%' THEN 'ATIVO_CIRCULANTE'
-                WHEN p.DescN0 = 'ATIVO' AND p.DescN1 NOT LIKE '%Circulante%' THEN 'ATIVO_NAO_CIRCULANTE'
-                WHEN p.DescN0 = 'PASSIVO' AND p.DescN1 LIKE '%Circulante%' THEN 'PASSIVO_CIRCULANTE'
-                WHEN p.DescN0 = 'PASSIVO' AND p.DescN1 NOT LIKE '%Circulante%' THEN 'PASSIVO_NAO_CIRCULANTE'
-                WHEN p.DescN1 LIKE '%Patrimônio%' OR p.DescN1 LIKE '%Líquido%' THEN 'PATRIMONIO_LIQUIDO'
-                WHEN p.DescN0 LIKE '%RECEITA%' OR p.DescN1 LIKE '%Receita%' THEN 'RECEITAS'
-                WHEN p.DescN0 LIKE '%DESPESA%' OR p.DescN1 LIKE '%Despesa%' THEN 'DESPESAS'
-                WHEN p.DescN0 LIKE '%CUSTO%' OR p.DescN1 LIKE '%Custo%' THEN 'CUSTOS'
-                ELSE 'OUTROS'
-            END as GrupoContabil
+            b.[Mês], b.Ano, b.[Cod Empresa], b.[Cod Conta Contabil PN],
+            p.[DESCRIÇÃO CONTA], p.DescN0, p.DescN1, p.DescN2,
+            b.Saldo, b.R12, b.R1, b.R1_12,
+            b.dIndicador, b.R1Indicador, b.R12Indicador,
+            b.dContaDFC
         FROM dbo.fBalancete_Consolidado b
         LEFT JOIN dbo.dPlanoContasSFV p ON b.[Cod Conta Contabil PN] = p.[CÓD CONTA]
-        LEFT JOIN dbo.dIndicador i ON b.dIndicador = i.ID
-        LEFT JOIN dbo.dContaDFC dfc ON b.dContaDFC = dfc.CodDFC
         WHERE b.[Cod Empresa] = ?
-        AND b.Saldo IS NOT NULL
-        ORDER BY b.Ano DESC, b.[Mês] DESC, b.[Cod Conta Contabil PN]
+        ORDER BY b.Ano DESC, b.[Mês] DESC
         """
-        
         df = pd.read_sql(query, self.conn, params=[cod_empresa])
         
-        # Melhora a classificação das contas
-        df = self.enhance_account_classification(df)
+        # Enriquece dados com mapeamentos internos
+        df = self._enrich_dfc_from_mapping(df)
+        df = self._enrich_indicators_from_mapping(df)
         
         return df
     
-    def enhance_account_classification(self, df):
-        """
-        Melhora a classificação das contas contábeis baseada na descrição
-        """
-        df = df.copy()
+    def _enrich_dfc_from_mapping(self, df):
+        """Enriquece dados com mapeamento DFC interno"""
+        def get_dfc_info(cod_dfc):
+            if pd.isna(cod_dfc):
+                return pd.Series([None, None, None])
+            cod_str = str(cod_dfc).strip()
+            if cod_str in self.dfc_mapping:
+                info = self.dfc_mapping[cod_str]
+                return pd.Series([info['linha'], info['agrupador'], info['ordem']])
+            return pd.Series([None, None, None])
         
-        def improve_classification(row):
-            desc = str(row.get('DESCRIÇÃO CONTA', '')).upper()
-            grupo_atual = row.get('GrupoContabil', 'OUTROS')
-
-            if any(word in desc for word in ['CAIXA', 'BANCO', 'CONTA CORRENTE', 'APLICAÇÃO']):
-                return 'ATIVO_CIRCULANTE'
-            elif any(word in desc for word in ['ESTOQUE', 'MERCADORIA', 'MATÉRIA PRIMA']):
-                return 'ATIVO_CIRCULANTE'
-            elif any(word in desc for word in ['CLIENTE', 'DUPLICATA RECEBER', 'CONTAS RECEBER']):
-                return 'ATIVO_CIRCULANTE'
-            elif any(word in desc for word in ['IMÓVEL', 'VEÍCULO', 'MÁQUINA', 'EQUIPAMENTO', 'IMOBILIZADO']):
-                return 'ATIVO_NAO_CIRCULANTE'
-            elif any(word in desc for word in ['FORNECEDOR', 'DUPLICATA PAGAR', 'CONTAS PAGAR']):
-                return 'PASSIVO_CIRCULANTE'
-            elif any(word in desc for word in ['EMPRÉSTIMO', 'FINANCIAMENTO']) and 'LONGO PRAZO' not in desc:
-                return 'PASSIVO_CIRCULANTE'
-            elif any(word in desc for word in ['CAPITAL', 'RESERVA', 'LUCRO', 'PREJUÍZO']):
-                return 'PATRIMONIO_LIQUIDO'
-            elif any(word in desc for word in ['RECEITA', 'VENDA', 'FATURAMENTO']):
-                return 'RECEITAS'
-            elif any(word in desc for word in ['CUSTO', 'CMV', 'CPV']):
-                return 'CUSTOS'
-            elif any(word in desc for word in ['DESPESA', 'GASTO']):
-                return 'DESPESAS'
-            else:
-                return grupo_atual
-        
-        df['GrupoContabil'] = df.apply(improve_classification, axis=1)
-        
+        df[['LinhaDFC', 'Agrupador', 'OrdemAgrupador']] = df['dContaDFC'].apply(get_dfc_info)
         return df
     
-    def analyze_existing_indicators(self, df):
-        """
-        Analisa indicadores já calculados presentes na base
-        """
-        indicators_analysis = []
+    def _enrich_indicators_from_mapping(self, df):
+        """Enriquece dados com mapeamento de indicadores interno"""
+        def get_indicator_name(cod_ind):
+            if pd.isna(cod_ind):
+                return None
+            try:
+                cod_int = int(cod_ind)
+                if cod_int in self.indicators_mapping:
+                    return self.indicators_mapping[cod_int]['nome']
+            except:
+                pass
+            return None
         
-        # Filtra registros com indicadores calculados
-        df_indicators = df[df['dIndicador'].notna() & df['R1Indicador'].notna()].copy()
-        
-        if not df_indicators.empty:
-            # Agrupa por indicador e período
-            for (indicador, periodo), group in df_indicators.groupby(['dIndicador', 'Ano', 'Mês']):
-                # Pega o primeiro registro do grupo (todos devem ter os mesmos valores de indicador)
-                row = group.iloc[0]
-                
-                analysis = {
-                    'periodo': f"{row['Ano']}-{int(row['Mês']):02d}",
-                    'ano': row['Ano'],
-                    'mes': row['Mês'],
-                    'codigo_indicador': row['dIndicador'],
-                    'descricao_indicador': row.get('DescIndicador', 'N/A'),
-                    'r1_indicador': row['R1Indicador'],
-                    'r12_indicador': row['R12Indicador'],
-                    'tipo': 'MENSAL' if pd.notna(row['R1Indicador']) else 'ANUAL'
-                }
-                
-                indicators_analysis.append(analysis)
-        
-        return pd.DataFrame(indicators_analysis)
+        df['DescIndicador'] = df['dIndicador'].apply(get_indicator_name)
+        return df
     
-    def analyze_dfc_data(self, df):
-        """
-        Analisa dados da Demonstração do Fluxo de Caixa já calculados
-        """
-        dfc_analysis = []
-        
-        # Filtra registros com DFC
-        df_dfc = df[df['dContaDFC'].notna()].copy()
-        
-        if not df_dfc.empty:
-            # Ordena por período e ordem do DFC
-            df_dfc['periodo'] = df_dfc['Ano'].astype(str) + '-' + df_dfc['Mês'].astype(str).str.zfill(2)
-            df_dfc = df_dfc.sort_values(['periodo', 'OrdemAgrupador'])
-            
-            for periodo in df_dfc['periodo'].unique():
-                periodo_data = df_dfc[df_dfc['periodo'] == periodo]
-                
-                for agrupador in periodo_data['Agrupador'].unique():
-                    agrupador_data = periodo_data[periodo_data['Agrupador'] == agrupador]
-                    
-                    # Soma os valores do mesmo agrupador
-                    saldo_agrupador = agrupador_data['Saldo'].sum()
-                    
-                    dfc_analysis.append({
-                        'periodo': periodo,
-                        'agrupador_dfc': agrupador,
-                        'valor': saldo_agrupador,
-                        'qtd_linhas': len(agrupador_data)
-                    })
-        
-        return pd.DataFrame(dfc_analysis)
+    def extract_value(self, row):
+        """Extrai o valor correto: R1 para DFC/Indicador, Saldo para outros"""
+        if pd.notna(row.get('dContaDFC')) or pd.notna(row.get('dIndicador')):
+            return row.get('R1', 0) if pd.notna(row.get('R1')) else 0
+        return row.get('Saldo', 0) if pd.notna(row.get('Saldo')) else 0
     
-    def calculate_variations_existing_data(self, df):
-        """
-        Calcula variações baseadas nos dados já existentes (R1, R12)
-        """
+    def analyze_large_variations(self, df):
+        """Analisa variações superiores a 100%"""
         variations = []
         
-        # Agrupa por conta contábil
+        df['periodo'] = df['Ano'].astype(str) + '-' + df['Mês'].astype(str).str.zfill(2)
+        df['valor_analise'] = df.apply(self.extract_value, axis=1)
+        
         for conta in df['Cod Conta Contabil PN'].unique():
-            conta_data = df[df['Cod Conta Contabil PN'] == conta].copy()
+            conta_data = df[df['Cod Conta Contabil PN'] == conta].sort_values('periodo')
             
-            # Ordena por período
-            conta_data = conta_data.sort_values(['Ano', 'Mês'])
+            if len(conta_data) < 2:
+                continue
             
-            if len(conta_data) > 1:
-                # Calcula variações usando R1 (último mês) se disponível
-                if 'R1' in conta_data.columns and not conta_data['R1'].isna().all():
-                    # Usa R1 para variação mensal
-                    for i in range(1, len(conta_data)):
-                        current = conta_data.iloc[i]
-                        previous = conta_data.iloc[i-1]
-                        
-                        if pd.notna(current['R1']) and pd.notna(previous['R1']):
-                            variacao_pct = ((current['R1'] - previous['R1']) / abs(previous['R1'])) * 100 if previous['R1'] != 0 else 0
-                            variacao_abs = current['R1'] - previous['R1']
-                            
-                            variations.append({
-                                'conta': current['Cod Conta Contabil PN'],
-                                'descricao': current.get('DESCRIÇÃO CONTA', 'N/A'),
-                                'grupo_contabil': current.get('GrupoContabil', 'N/A'),
-                                'periodo': f"{current['Ano']}-{int(current['Mês']):02d}",
-                                'saldo_atual': current['R1'],
-                                'saldo_anterior': previous['R1'],
-                                'variacao_pct': variacao_pct,
-                                'variacao_abs': variacao_abs,
-                                'tipo': 'MENSAL_R1'
-                            })
-        
-        return pd.DataFrame(variations)
-    
-    def generate_financial_summary_existing_data(self, df):
-        """
-        Gera resumo financeiro utilizando dados já consolidados
-        """
-        summary = {}
-        
-        # Utiliza os grupos já classificados para somar os saldos
-        grupos = df['GrupoContabil'].unique()
-        
-        for grupo in grupos:
-            grupo_data = df[df['GrupoContabil'] == grupo]
-            summary[grupo.lower()] = grupo_data['Saldo'].sum()
-        
-        # Adiciona informações básicas
-        summary['periodo_inicio'] = f"{df['Ano'].min()}-{df['Mês'].min():02d}"
-        summary['periodo_fim'] = f"{df['Ano'].max()}-{df['Mês'].max():02d}"
-        summary['total_contas'] = df['Cod Conta Contabil PN'].nunique()
-        
-        return summary
-    
-    def analyze_cash_flow_existing(self, df):
-        """
-        Analisa fluxo de caixa baseado em contas de caixa já identificadas
-        """
-        caixa_data = df[df['DESCRIÇÃO CONTA'].str.contains('CAIXA|BANCO', case=False, na=False)]
-        
-        if caixa_data.empty:
-            return {
-                'saldo_atual': 0,
-                'movimentacao_total': 0,
-                'periodos_analisados': 0
-            }
-        
-        # Ordena por período
-        caixa_data = caixa_data.sort_values(['Ano', 'Mês'])
-        
-        return {
-            'saldo_atual': caixa_data['Saldo'].iloc[-1] if len(caixa_data) > 0 else 0,
-            'saldo_inicial': caixa_data['Saldo'].iloc[0] if len(caixa_data) > 0 else 0,
-            'variacao_total': caixa_data['Saldo'].iloc[-1] - caixa_data['Saldo'].iloc[0] if len(caixa_data) > 1 else 0,
-            'periodos_analisados': len(caixa_data),
-            'media_mensal': caixa_data['Saldo'].mean()
-        }
-    
-    def generate_analysis_report(self, cod_empresa, df, indicators_df, variations_df, dfc_df, financial_summary, cash_flow_analysis):
-        """
-        Gera relatório de análise completo baseado nos dados existentes
-        """
-        report_lines = []
-        
-        report_lines.append("="*100)
-        report_lines.append("🌾 RELATÓRIO DE ANÁLISE FINANCEIRA - VALLEY IRRIGAÇÃO")
-        report_lines.append("📊 Baseado em dados consolidados existentes")
-        report_lines.append("="*100)
-        
-        # Informações básicas
-        report_lines.append(f"\n📋 INFORMAÇÕES GERAIS:")
-        report_lines.append(f"   • Empresa: {cod_empresa}")
-        report_lines.append(f"   • Período analisado: {financial_summary['periodo_inicio']} a {financial_summary['periodo_fim']}")
-        report_lines.append(f"   • Total de contas analisadas: {financial_summary['total_contas']}")
-        
-        # Resumo por grupos contábeis
-        report_lines.append(f"\n💰 RESUMO PATRIMONIAL:")
-        for grupo, valor in financial_summary.items():
-            if any(key in grupo for key in ['ativo', 'passivo', 'patrimonio']):
-                report_lines.append(f"   • {grupo.upper().replace('_', ' ')}: R$ {valor:>15,.2f}")
-        
-        # Análise de indicadores
-        if not indicators_df.empty:
-            report_lines.append(f"\n📈 INDICADORES FINANCEIROS:")
-            for indicador in indicators_df['codigo_indicador'].unique():
-                ind_data = indicators_df[indicators_df['codigo_indicador'] == indicador]
-                descricao = ind_data['descricao_indicador'].iloc[0]
+            for i in range(1, len(conta_data)):
+                atual = conta_data.iloc[i]
+                anterior = conta_data.iloc[i-1]
                 
-                report_lines.append(f"\n   {descricao}:")
-                for _, row in ind_data.iterrows():
-                    report_lines.append(f"      • {row['periodo']}: {row['r1_indicador']:.2f}")
+                val_atual = atual['valor_analise']
+                val_anterior = anterior['valor_analise']
+                
+                if val_anterior != 0 and abs(val_atual) > 0:
+                    var_pct = ((val_atual - val_anterior) / abs(val_anterior)) * 100
+                    
+                    if abs(var_pct) > 100:
+                        variations.append({
+                            'conta': conta,
+                            'descricao': atual.get('DESCRIÇÃO CONTA', 'N/A'),
+                            'periodo': atual['periodo'],
+                            'valor_anterior': val_anterior,
+                            'valor_atual': val_atual,
+                            'variacao_pct': var_pct,
+                            'variacao_abs': val_atual - val_anterior
+                        })
         
-        # Análise DFC
-        if not dfc_df.empty:
-            report_lines.append(f"\n💸 DEMONSTRAÇÃO DO FLUXO DE CAIXA:")
-            for periodo in dfc_df['periodo'].unique():
-                periodo_data = dfc_df[dfc_df['periodo'] == periodo]
-                report_lines.append(f"\n   Período {periodo}:")
-                for _, row in periodo_data.iterrows():
-                    report_lines.append(f"      • {row['agrupador_dfc']}: R$ {row['valor']:>15,.2f}")
+        return pd.DataFrame(variations).sort_values('variacao_pct', key=abs, ascending=False)
+    
+    def analyze_dfc(self, df):
+        """Analisa Demonstração do Fluxo de Caixa"""
+        df_dfc = df[df['dContaDFC'].notna()].copy()
         
-        # Análise de variações
-        if not variations_df.empty:
-            report_lines.append(f"\n📊 VARIAÇÕES SIGNIFICATIVAS:")
-            variacoes_significativas = variations_df[abs(variations_df['variacao_pct']) > 30]
+        if df_dfc.empty:
+            return pd.DataFrame()
+        
+        df_dfc['periodo'] = df_dfc['Ano'].astype(str) + '-' + df_dfc['Mês'].astype(str).str.zfill(2)
+        df_dfc['valor_dfc'] = df_dfc['R1'].fillna(0)
+        
+        dfc_summary = df_dfc.groupby(['periodo', 'Agrupador', 'OrdemAgrupador']).agg({
+            'valor_dfc': 'sum'
+        }).reset_index().sort_values(['periodo', 'OrdemAgrupador'])
+        
+        return dfc_summary
+    
+    def analyze_indicators(self, df):
+        """Analisa indicadores financeiros"""
+        df_ind = df[df['dIndicador'].notna()].copy()
+        
+        if df_ind.empty:
+            return pd.DataFrame()
+        
+        df_ind['periodo'] = df_ind['Ano'].astype(str) + '-' + df_ind['Mês'].astype(str).str.zfill(2)
+        
+        indicators_summary = df_ind.groupby(['periodo', 'dIndicador', 'DescIndicador']).agg({
+            'R1Indicador': 'first',
+            'R12Indicador': 'first'
+        }).reset_index()
+        
+        return indicators_summary
+    
+    def generate_finma_insight(self, context_text):
+        """Gera insights usando FinMA-7B"""
+        if not self.finma_model or not FINMA_AVAILABLE:
+            return "Análise via FinMA-7B não disponível."
+        
+        try:
+            prompt = f"""Você é um analista financeiro especializado. Analise os seguintes dados financeiros e forneça insights concisos e práticos:
+
+{context_text}
+
+Forneça uma análise objetiva focada em:
+1. Principais riscos identificados
+2. Oportunidades de melhoria
+3. Recomendações prioritárias
+
+Análise:"""
             
-            for _, var in variacoes_significativas.iterrows():
-                sinal = "📈" if var['variacao_pct'] > 0 else "📉"
-                report_lines.append(f"   {sinal} {var['descricao'][:40]}...: {var['variacao_pct']:+.1f}%")
+            inputs = self.finma_tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
+            inputs = {k: v.to(self.finma_model.device) for k, v in inputs.items()}
+            
+            with torch.no_grad():
+                outputs = self.finma_model.generate(
+                    **inputs,
+                    max_new_tokens=300,
+                    temperature=0.7,
+                    do_sample=True,
+                    top_p=0.9
+                )
+            
+            response = self.finma_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            analysis = response.split("Análise:")[-1].strip()
+            
+            return analysis if analysis else "Análise inconclusiva."
+            
+        except Exception as e:
+            return f"Erro ao gerar insight: {str(e)}"
+    
+    def generate_report(self, cod_empresa, variations_df, dfc_df, indicators_df):
+        """Gera relatório completo com insights do FinMA"""
+        report = []
+        report.append("="*100)
+        report.append("🌾 RELATÓRIO DE ANÁLISE FINANCEIRA - VALLEY IRRIGAÇÃO")
+        report.append(f"📊 Empresa: {cod_empresa} | Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        report.append("="*100)
         
-        # Situação do caixa
-        report_lines.append(f"\n💵 SITUAÇÃO DO CAIXA:")
-        report_lines.append(f"   • Saldo atual: R$ {cash_flow_analysis['saldo_atual']:>15,.2f}")
-        report_lines.append(f"   • Variação no período: R$ {cash_flow_analysis['variacao_total']:>11,.2f}")
-        report_lines.append(f"   • Períodos analisados: {cash_flow_analysis['periodos_analisados']:>10}")
+        # 1. VARIAÇÕES SIGNIFICATIVAS (>100%)
+        report.append("\n📈 VARIAÇÕES SIGNIFICATIVAS (>100%)")
+        report.append("-"*100)
         
-        report_lines.append("\n" + "="*100)
+        if not variations_df.empty:
+            top_variations = variations_df.head(10)
+            for _, var in top_variations.iterrows():
+                sinal = "⬆️" if var['variacao_pct'] > 0 else "⬇️"
+                report.append(f"{sinal} {var['descricao'][:50]}")
+                report.append(f"   Período: {var['periodo']} | Variação: {var['variacao_pct']:+.1f}%")
+                report.append(f"   Anterior: R$ {var['valor_anterior']:,.2f} → Atual: R$ {var['valor_atual']:,.2f}")
+                report.append("")
+            
+            # Insight FinMA sobre variações
+            context = f"Variações superiores a 100%:\n"
+            for _, var in top_variations.head(5).iterrows():
+                context += f"- {var['descricao']}: {var['variacao_pct']:+.1f}%\n"
+            
+            report.append("🤖 INSIGHT FinMA - Variações:")
+            report.append(self.generate_finma_insight(context))
+        else:
+            report.append("Nenhuma variação superior a 100% identificada.")
         
-        return "\n".join(report_lines)
+        # 2. ANÁLISE DFC
+        report.append("\n\n💸 DEMONSTRAÇÃO DO FLUXO DE CAIXA")
+        report.append("-"*100)
+        
+        if not dfc_df.empty:
+            ultimo_periodo = dfc_df['periodo'].max()
+            dfc_periodo = dfc_df[dfc_df['periodo'] == ultimo_periodo]
+            
+            report.append(f"Período: {ultimo_periodo}\n")
+            for agrupador in dfc_periodo['Agrupador'].unique():
+                agrup_data = dfc_periodo[dfc_periodo['Agrupador'] == agrupador]
+                total = agrup_data['valor_dfc'].sum()
+                report.append(f"  {agrupador}: R$ {total:>15,.2f}")
+            
+            # Insight FinMA sobre DFC
+            context_dfc = f"Fluxo de Caixa ({ultimo_periodo}):\n"
+            for agrupador in dfc_periodo['Agrupador'].unique():
+                total = dfc_periodo[dfc_periodo['Agrupador'] == agrupador]['valor_dfc'].sum()
+                context_dfc += f"- {agrupador}: R$ {total:,.2f}\n"
+            
+            report.append("\n🤖 INSIGHT FinMA - Fluxo de Caixa:")
+            report.append(self.generate_finma_insight(context_dfc))
+        else:
+            report.append("Dados de DFC não disponíveis.")
+        
+        # 3. INDICADORES FINANCEIROS
+        report.append("\n\n📊 INDICADORES FINANCEIROS PRINCIPAIS")
+        report.append("-"*100)
+        
+        if not indicators_df.empty:
+            ultimo_periodo = indicators_df['periodo'].max()
+            ind_periodo = indicators_df[indicators_df['periodo'] == ultimo_periodo]
+            
+            report.append(f"Período: {ultimo_periodo}\n")
+            for _, ind in ind_periodo.iterrows():
+                cod_ind = int(ind['dIndicador'])
+                if cod_ind in self.indicators_mapping:
+                    info = self.indicators_mapping[cod_ind]
+                    report.append(f"  {info['nome']}: {ind['R1Indicador']:.2f}")
+                    report.append(f"    Categoria: {info['tipo']} | Melhor: {info['melhor']}")
+                    report.append("")
+            
+            # Insight FinMA sobre indicadores
+            context_ind = f"Indicadores Financeiros ({ultimo_periodo}):\n"
+            for _, ind in ind_periodo.head(8).iterrows():
+                cod_ind = int(ind['dIndicador'])
+                if cod_ind in self.indicators_mapping:
+                    nome = self.indicators_mapping[cod_ind]['nome']
+                    context_ind += f"- {nome}: {ind['R1Indicador']:.2f}\n"
+            
+            report.append("🤖 INSIGHT FinMA - Indicadores:")
+            report.append(self.generate_finma_insight(context_ind))
+        else:
+            report.append("Dados de indicadores não disponíveis.")
+        
+        report.append("\n" + "="*100)
+        report.append("Fim do Relatório")
+        report.append("="*100)
+        
+        return "\n".join(report)
     
     def run_analysis(self):
-        """
-        Executa análise completa baseada em dados existentes
-        """
-        print("\n" + "="*80)
-        print("🌾 ANÁLISE FINANCEIRA - VALLEY IRRIGAÇÃO")
-        print("📊 Utilizando dados consolidados existentes")
+        """Executa análise completa"""
+        print("\n🚀 SISTEMA DE ANÁLISE FINANCEIRA COM FinMA-7B")
         print("="*80)
         
         if not self.connect_database():
             return
         
         try:
-            cod_empresa = input("\n📊 Digite o código da empresa para análise: ").strip()
+            cod_empresa = input("\n📊 Código da empresa: ").strip()
             if not cod_empresa:
-                print("❌ Código da empresa é obrigatório!")
+                print("❌ Código obrigatório!")
                 return
             
             print(f"\n🔍 Extraindo dados da empresa {cod_empresa}...")
             df = self.get_company_data(cod_empresa)
             
             if df.empty:
-                print(f"❌ Nenhum dado encontrado para a empresa {cod_empresa}")
+                print(f"❌ Nenhum dado encontrado para empresa {cod_empresa}")
                 return
             
-            print("📈 Analisando indicadores existentes...")
-            indicators_df = self.analyze_existing_indicators(df)
+            print("📊 Analisando variações superiores a 100%...")
+            variations_df = self.analyze_large_variations(df)
             
-            print("💸 Analisando Demonstração do Fluxo de Caixa...")
-            dfc_df = self.analyze_dfc_data(df)
+            print("💸 Analisando Fluxo de Caixa...")
+            dfc_df = self.analyze_dfc(df)
             
-            print("📊 Calculando variações...")
-            variations_df = self.calculate_variations_existing_data(df)
+            print("📈 Analisando indicadores financeiros...")
+            indicators_df = self.analyze_indicators(df)
             
-            print("💰 Gerando resumo financeiro...")
-            financial_summary = self.generate_financial_summary_existing_data(df)
+            print("📝 Gerando relatório com insights FinMA...")
+            report = self.generate_report(cod_empresa, variations_df, dfc_df, indicators_df)
             
-            print("💵 Analisando situação do caixa...")
-            cash_flow_analysis = self.analyze_cash_flow_existing(df)
-            
-            print("📋 Gerando relatório final...")
-            report = self.generate_analysis_report(
-                cod_empresa, df, indicators_df, variations_df, 
-                dfc_df, financial_summary, cash_flow_analysis
-            )
-            
-            # Exibe o relatório
             print("\n" + report)
             
-            # Opção para salvar
-            save = input("\n💾 Deseja salvar o relatório? (s/n): ").lower()
+            save = input("\n💾 Salvar relatório? (s/n): ").lower()
             if save == 's':
-                filename = f"relatorio_empresa_{cod_empresa}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                filename = f"relatorio_finma_{cod_empresa}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
                 with open(filename, 'w', encoding='utf-8') as f:
                     f.write(report)
-                print(f"✅ Relatório salvo como: {filename}")
-            
+                print(f"✅ Relatório salvo: {filename}")
+                
         except Exception as e:
-            print(f"❌ Erro durante a análise: {e}")
+            print(f"❌ Erro: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             if self.conn:
                 self.conn.close()
 
 def main():
-    """
-    Função principal
-    """
-    print("🚀 Iniciando Sistema de Análise Financeira...")
+    print("🌾 Sistema de Análise Financeira - Valley Irrigação")
+    print("="*80)
     
-    # Configuração de conexão
-    server = input("🖥️  Servidor (Enter para localhost): ").strip() or "localhost"
+    server = input("🖥️  Servidor (Enter = localhost): ").strip() or "localhost"
     database = input("🗄️  Banco de dados: ").strip()
     
     if not database:
-        print("❌ Nome do banco de dados é obrigatório!")
+        print("❌ Nome do banco é obrigatório!")
         return
     
     connection_string = f"""
@@ -451,11 +425,8 @@ def main():
     Trusted_Connection=yes;
     """
     
-    try:
-        analyzer = EnhancedFinancialAnalyzer(connection_string)
-        analyzer.run_analysis()
-    except Exception as e:
-        print(f"❌ Erro: {e}")
+    analyzer = FinancialAnalyzerWithFinMA(connection_string)
+    analyzer.run_analysis()
 
 if __name__ == "__main__":
     main()
